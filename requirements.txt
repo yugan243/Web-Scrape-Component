@@ -4,3 +4,4 @@ json
 datetime
 lxml
 pandas
+tdqm
