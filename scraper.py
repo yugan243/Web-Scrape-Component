@@ -1,5 +1,5 @@
-import requests
-from bs4 import BeautifulSoup
+import httpx
+from selectolax.parser import HTMLParser
 import json
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,46 +7,43 @@ from tqdm import tqdm
 import time
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-BASE_SITE  = "https://www.laptop.lk"
+BASE_SITE = "https://www.laptop.lk"
 CAT_PREFIX = BASE_SITE + "/index.php/product-category/"
-HEADERS    = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 MAX_WORKERS = 10
-REQUEST_TIMEOUT = 8   # seconds
-MAX_RETRIES     = 2   # on transient network errors
+REQUEST_TIMEOUT = 8  # seconds
+MAX_RETRIES = 2  # on transient network errors
 
-# ─── GLOBAL SESSION ─────────────────────────────────────────────────────────
-session = requests.Session()
-session.headers.update(HEADERS)
+# ─── GLOBAL CLIENT ─────────────────────────────────────────────────────────
+client = httpx.Client(timeout=REQUEST_TIMEOUT, headers=HEADERS)
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────────
-def fetch_soup(url):
+def fetch_html(url):
     """
-    Fetches the URL with a timeout, retries once on error,
-    and never raises—returns an empty soup on failure.
+    Fetches the URL with retries and returns selectolax HTML tree.
     """
     for attempt in range(1, MAX_RETRIES + 2):
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
+            resp = client.get(url)
             resp.raise_for_status()
-            return BeautifulSoup(resp.text, "lxml")
-        except requests.RequestException as e:
+            return HTMLParser(resp.text)
+        except httpx.RequestError as e:
             if attempt <= MAX_RETRIES:
-                time.sleep(1)   # tiny back-off
+                time.sleep(1)
                 continue
             print(f" Fetch failed [{e.__class__.__name__}] on {url}")
-            return BeautifulSoup("", "lxml")
+            return HTMLParser("")
 
 # ─── 1. CATEGORY DISCOVERY ─────────────────────────────────────────────────
 def get_all_category_links():
-    soup = fetch_soup(BASE_SITE)
+    tree = fetch_html(BASE_SITE)
     cats = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
+    for a in tree.css("a"):
+        href = (a.attributes.get("href") or "").strip()
         if href.startswith(CAT_PREFIX) and href != CAT_PREFIX:
-            name = a.get_text(strip=True)
+            name = a.text(strip=True)
             if name:
                 cats.append({"name": name, "url": href})
-    # dedupe
     seen = set()
     return [c for c in cats if not (c["url"] in seen or seen.add(c["url"]))]
 
@@ -56,73 +53,69 @@ def get_all_product_links(category_url):
     page = 1
     while True:
         url = category_url if page == 1 else f"{category_url.rstrip('/')}/page/{page}/"
-        # fetch but don’t raise on 404
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException:
+            resp = client.get(url)
+        except httpx.RequestError:
             break
         if resp.status_code == 404:
             break
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        prods = soup.select("a.woocommerce-LoopProduct-link")
+        tree = HTMLParser(resp.text)
+        prods = tree.css("a.woocommerce-LoopProduct-link")
         if not prods:
             break
 
         for p in prods:
-            href = p.get("href")
+            href = p.attributes.get("href")
             if href:
                 urls.append(href)
         page += 1
-
     return urls
 
 # ─── 3. PRODUCT PARSER ──────────────────────────────────────────────────────
 def scrape_product_details(prod_url, category):
-    soup = fetch_soup(prod_url)
-    ts   = datetime.datetime.now().isoformat()
+    tree = fetch_html(prod_url)
+    ts = datetime.datetime.now().isoformat()
 
-    title = soup.select_one("h1.product_title.entry-title")
-    price = soup.select_one("p.price bdi")
-    desc  = soup.select_one("div.woocommerce-product-details__short-description")
-    warranty = next((s for s in soup.stripped_strings if "warranty" in s.lower()),
-                    "Warranty not found")
+    title = tree.css_first("h1.product_title.entry-title")
+    price = tree.css_first("p.price bdi")
+    desc = tree.css_first("div.woocommerce-product-details__short-description")
+    warranty = next((s for s in tree.text().splitlines() if "warranty" in s.lower()), "Warranty not found")
 
     specs = {}
-    tbl = soup.select_one("table.shop_attributes")
+    tbl = tree.css_first("table.shop_attributes")
     if tbl:
-        for tr in tbl.select("tr"):
-            k = tr.select_one("th").get_text(strip=True)
-            v = tr.select_one("td").get_text(strip=True)
-            specs[k] = v
+        for tr in tbl.css("tr"):
+            th = tr.css_first("th")
+            td = tr.css_first("td")
+            if th and td:
+                specs[th.text(strip=True)] = td.text(strip=True)
     else:
-        blk = soup.select_one("div#tab-specification")
+        blk = tree.css_first("div#tab-specification")
         if blk:
-            for line in blk.get_text("\n").split("\n"):
+            for line in blk.text().split("\n"):
                 if ":" in line:
                     k, v = line.split(":", 1)
                     specs[k.strip()] = v.strip()
     if not specs:
         specs = "Specs not found"
 
-    rate_tag = soup.select_one("div.star-rating")
-    rating   = rate_tag["title"] if rate_tag and rate_tag.has_attr("title") else "No rating"
-    reviews  = "Reviews not supported"
-    imgs     = [img["src"]
-                for img in soup.select("figure.woocommerce-product-gallery__wrapper img")
-                if img.has_attr("src")]
+    rate_tag = tree.css_first("div.star-rating")
+    rating = rate_tag.attributes.get("title", "No rating") if rate_tag else "No rating"
+
+    imgs = [img.attributes["src"] for img in tree.css("figure.woocommerce-product-gallery__wrapper img") if "src" in img.attributes]
 
     return {
-        "timestamp":      ts,
-        "category":       category,
-        "title":          title.get_text(strip=True) if title else "No title",
-        "price":          price.get_text(strip=True) if price else "No price",
-        "warranty":       warranty,
-        "description":    desc.get_text(strip=True)  if desc  else "No description",
+        "timestamp": ts,
+        "category": category,
+        "title": title.text(strip=True) if title else "No title",
+        "price": price.text(strip=True) if price else "No price",
+        "warranty": warranty,
+        "description": desc.text(strip=True) if desc else "No description",
         "specifications": specs,
-        "reviews":        reviews,
-        "ratings":        rating,
-        "image_urls":     imgs
+        "reviews": "Reviews not supported",
+        "ratings": rating,
+        "image_urls": imgs
     }
 
 # ─── 4. MAIN ────────────────────────────────────────────────────────────────
@@ -159,7 +152,6 @@ def main():
                 except Exception as e:
                     print(f"   ⚠️ Error on {url}: {e}")
 
-    # dump to JSON
     with open("laptoplk_products.json", "w", encoding="utf-8") as f:
         json.dump(all_data, f, ensure_ascii=False, indent=2)
 
